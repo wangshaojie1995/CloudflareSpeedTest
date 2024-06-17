@@ -11,16 +11,18 @@ import (
 )
 
 const (
-	defaultOutput = "result.csv"
-	maxDelay      = 9999 * time.Millisecond
-	minDelay      = 0 * time.Millisecond
+	defaultOutput         = "result.csv"
+	maxDelay              = 9999 * time.Millisecond
+	minDelay              = 0 * time.Millisecond
+	maxLossRate   float32 = 1.0
 )
 
 var (
-	InputMaxDelay = maxDelay
-	InputMinDelay = minDelay
-	Output        = defaultOutput
-	PrintNum      = 10
+	InputMaxDelay    = maxDelay
+	InputMinDelay    = minDelay
+	InputMaxLossRate = maxLossRate
+	Output           = defaultOutput
+	PrintNum         = 10
 )
 
 // 是否打印测试结果
@@ -42,16 +44,17 @@ type PingData struct {
 
 type CloudflareIPData struct {
 	*PingData
-	recvRate      float32
+	lossRate      float32
 	DownloadSpeed float64
 }
 
-func (cf *CloudflareIPData) getRecvRate() float32 {
-	if cf.recvRate == 0 {
+// 计算丢包率
+func (cf *CloudflareIPData) getLossRate() float32 {
+	if cf.lossRate == 0 {
 		pingLost := cf.Sended - cf.Received
-		cf.recvRate = float32(pingLost) / float32(cf.Sended)
+		cf.lossRate = float32(pingLost) / float32(cf.Sended)
 	}
-	return cf.recvRate
+	return cf.lossRate
 }
 
 func (cf *CloudflareIPData) toString() []string {
@@ -59,7 +62,7 @@ func (cf *CloudflareIPData) toString() []string {
 	result[0] = cf.IP.String()
 	result[1] = strconv.Itoa(cf.Sended)
 	result[2] = strconv.Itoa(cf.Received)
-	result[3] = strconv.FormatFloat(float64(cf.getRecvRate()), 'f', 2, 32)
+	result[3] = strconv.FormatFloat(float64(cf.getLossRate()), 'f', 2, 32)
 	result[4] = strconv.FormatFloat(cf.Delay.Seconds()*1000, 'f', 2, 32)
 	result[5] = strconv.FormatFloat(cf.DownloadSpeed/1024/1024, 'f', 2, 32)
 	return result
@@ -89,17 +92,22 @@ func convertToString(data []CloudflareIPData) [][]string {
 	return result
 }
 
+// 延迟丢包排序
 type PingDelaySet []CloudflareIPData
 
+// 延迟条件过滤
 func (s PingDelaySet) FilterDelay() (data PingDelaySet) {
-	if InputMaxDelay > maxDelay || InputMinDelay < minDelay {
+	if InputMaxDelay > maxDelay || InputMinDelay < minDelay { // 当输入的延迟条件不在默认范围内时，不进行过滤
+		return s
+	}
+	if InputMaxDelay == maxDelay && InputMinDelay == minDelay { // 当输入的延迟条件为默认值时，不进行过滤
 		return s
 	}
 	for _, v := range s {
-		if v.Delay > InputMaxDelay { // 平均延迟上限
+		if v.Delay > InputMaxDelay { // 平均延迟上限，延迟大于条件最大值时，后面的数据都不满足条件，直接跳出循环
 			break
 		}
-		if v.Delay < InputMinDelay { // 平均延迟下限
+		if v.Delay < InputMinDelay { // 平均延迟下限，延迟小于条件最小值时，不满足条件，跳过
 			continue
 		}
 		data = append(data, v) // 延迟满足条件时，添加到新数组中
@@ -107,18 +115,30 @@ func (s PingDelaySet) FilterDelay() (data PingDelaySet) {
 	return
 }
 
+// 丢包条件过滤
+func (s PingDelaySet) FilterLossRate() (data PingDelaySet) {
+	if InputMaxLossRate >= maxLossRate { // 当输入的丢包条件为默认值时，不进行过滤
+		return s
+	}
+	for _, v := range s {
+		if v.getLossRate() > InputMaxLossRate { // 丢包几率上限
+			break
+		}
+		data = append(data, v) // 丢包率满足条件时，添加到新数组中
+	}
+	return
+}
+
 func (s PingDelaySet) Len() int {
 	return len(s)
 }
-
 func (s PingDelaySet) Less(i, j int) bool {
-	iRate, jRate := s[i].getRecvRate(), s[j].getRecvRate()
+	iRate, jRate := s[i].getLossRate(), s[j].getLossRate()
 	if iRate != jRate {
 		return iRate < jRate
 	}
 	return s[i].Delay < s[j].Delay
 }
-
 func (s PingDelaySet) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
@@ -129,16 +149,14 @@ type DownloadSpeedSet []CloudflareIPData
 func (s DownloadSpeedSet) Len() int {
 	return len(s)
 }
-
 func (s DownloadSpeedSet) Less(i, j int) bool {
 	return s[i].DownloadSpeed > s[j].DownloadSpeed
 }
-
 func (s DownloadSpeedSet) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
-func (s DownloadSpeedSet) Print(ipv6 bool) {
+func (s DownloadSpeedSet) Print() {
 	if NoPrintResult() {
 		return
 	}
@@ -152,9 +170,12 @@ func (s DownloadSpeedSet) Print(ipv6 bool) {
 	}
 	headFormat := "%-16s%-5s%-5s%-5s%-6s%-11s\n"
 	dataFormat := "%-18s%-8s%-8s%-8s%-10s%-15s\n"
-	if ipv6 { // IPv6 太长了，所以需要调整一下间隔
-		headFormat = "%-40s%-5s%-5s%-5s%-6s%-11s\n"
-		dataFormat = "%-42s%-8s%-8s%-8s%-10s%-15s\n"
+	for i := 0; i < PrintNum; i++ { // 如果要输出的 IP 中包含 IPv6，那么就需要调整一下间隔
+		if len(dateString[i][0]) > 15 {
+			headFormat = "%-40s%-5s%-5s%-5s%-6s%-11s\n"
+			dataFormat = "%-42s%-8s%-8s%-8s%-10s%-15s\n"
+			break
+		}
 	}
 	fmt.Printf(headFormat, "IP 地址", "已发送", "已接收", "丢包率", "平均延迟", "下载速度 (MB/s)")
 	for i := 0; i < PrintNum; i++ {
